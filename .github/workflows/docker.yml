@@ -1,21 +1,103 @@
-name: Docker Build
+name: Build & Publish
 
 on:
-  schedule:
-    - cron: '35 4 * * 0'  # Runs on Sunday at 4:35 AM UTC
   push:
     branches: ["main"]
     tags: ['v*.*.*']
+  pull_request: # build + smoke-test only (no push) — validates flake.lock bumps
+  workflow_dispatch: # allow manual rebuilds from the Actions tab
 
 permissions:
   contents: read
   packages: write
 
 jobs:
-  docker-build:
+  build-and-push:
     runs-on: ubuntu-latest
     if: github.repository_owner == 'davis-a' # Prevent builds in forks
 
     steps:
-      - name: Publish to ghcr
-        uses: e621ng/publish-to-ghcr@v1
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # Only third-party action in the workflow: the NixOS project's own
+      # installer (no releases upstream, so pinned to a commit SHA).
+      - name: Install Nix
+        uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc # 2026-04-06
+
+      - name: Build OCI image
+        run: nix build .#ngircd-image --print-build-logs
+
+      # Boot the image and authenticate a real htpasswd entry over IRC. Gates
+      # publishing: if a nixpkgs bump breaks ngircd or pam_pwdfile, this fails
+      # and nothing is pushed (and the bump PR shows red).
+      - name: Smoke test (PAM login)
+        run: |
+          set -euo pipefail
+          podman load --quiet --input result
+          tmp="$(mktemp -d)"
+          hash="$(openssl passwd -6 -salt smoketest 'secretpass')"
+          printf 'tester:%s\n' "$hash" > "$tmp/pwdfile"
+          podman run -d --rm --name smoke -p 127.0.0.1:16667:6667 \
+            -v "$tmp/pwdfile:/etc/ngircd/pwdfile:ro" localhost/docker-ngircd:latest
+          # Wait for the listener to come up.
+          for _ in $(seq 1 20); do
+            (exec 3<>/dev/tcp/127.0.0.1/16667) 2>/dev/null && { exec 3>&-; break; }
+            sleep 0.5
+          done
+          set +e
+          python3 - <<'PY'
+          import socket, time, sys
+          s = socket.create_connection(("127.0.0.1", 16667), timeout=10)
+          s.sendall(b"PASS secretpass\r\nNICK tester\r\nUSER tester 0 * :smoke\r\n")
+          time.sleep(2); s.settimeout(3); data = b""
+          try:
+              while True:
+                  c = s.recv(4096)
+                  if not c: break
+                  data += c
+          except socket.timeout:
+              pass
+          txt = data.decode(errors="replace")
+          print(txt)
+          sys.exit(0 if " 001 " in txt else 1)
+          PY
+          rc=$?
+          set -e
+          podman stop smoke >/dev/null 2>&1 || true
+          rm -rf "$tmp"
+          if [ $rc -eq 0 ]; then echo "smoke test PASSED"; else echo "smoke test FAILED"; exit 1; fi
+
+      - name: Push to ghcr.io
+        if: github.event_name != 'pull_request' # never publish from a PR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # ghcr requires a lowercase image path.
+          image="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+
+          # The image was already loaded by the smoke-test step. Its name/tag are
+          # fixed by the Nix expression (name = "docker-ngircd"; tag = "latest").
+          src="localhost/docker-ngircd:latest"
+
+          # Decide tags: always a 12-char commit sha; `latest` on main;
+          # the bare version (e.g. 1.2.3) on a v* tag push.
+          tags=("${GITHUB_SHA:0:12}")
+          [ "$GITHUB_REF" = "refs/heads/main" ] && tags+=("latest")
+          case "$GITHUB_REF" in
+            refs/tags/v*) tags+=("${GITHUB_REF#refs/tags/v}") ;;
+          esac
+
+          printf '%s' "$GHCR_TOKEN" | podman login ghcr.io -u "$GHCR_USER" --password-stdin
+
+          for t in "${tags[@]}"; do
+            echo ">> pushing ${image}:${t}"
+            podman tag "$src" "${image}:${t}"
+            podman push "${image}:${t}"
+          done

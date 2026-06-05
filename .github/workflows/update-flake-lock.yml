@@ -1,0 +1,64 @@
+name: Update flake.lock
+
+# Weekly: re-resolve nixpkgs (nixos-26.05 HEAD) and, if it moved, open/refresh a
+# PR. The Build & Publish workflow builds + smoke-tests the PR so you can merge
+# with confidence; merging publishes a fresh `latest`, picking up backported
+# security fixes within a week.
+on:
+  schedule:
+    - cron: '35 4 * * 0' # Sunday 04:35 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-lock:
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'davis-a'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Nix
+        uses: NixOS/nix-installer-action@6b8548fe06acfb0155a50ab5d561accb215764cc # 2026-04-06
+
+      - name: Update flake.lock and open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          before="$(jq -r '.nodes.nixpkgs.locked.rev' flake.lock)"
+          nix flake update nixpkgs
+          after="$(jq -r '.nodes.nixpkgs.locked.rev' flake.lock)"
+
+          if [ "$before" = "$after" ]; then
+            echo "nixpkgs unchanged (${before:0:12}); nothing to do."
+            exit 0
+          fi
+          echo "nixpkgs ${before:0:12} -> ${after:0:12}"
+
+          today="$(date -u +%Y-%m-%d)"
+          branch="flake-lock-update"
+          git switch -C "$branch"
+          git add flake.lock
+          git commit -m "flake.lock: bump nixpkgs ${before:0:12} -> ${after:0:12} (${today})"
+          git push --force origin "$branch"
+
+          # One rolling PR: create it if absent, otherwise the force-push above
+          # already refreshed the open one.
+          if gh pr view "$branch" --json state --jq '.state' 2>/dev/null | grep -qx OPEN; then
+            echo "PR already open for $branch; refreshed."
+          else
+            gh pr create --base main --head "$branch" \
+              --title "flake.lock: weekly nixpkgs bump" \
+              --body "Automated weekly \`nix flake update\` against nixos-26.05.
+
+          nixpkgs \`${before:0:12}\` → \`${after:0:12}\`
+
+          The Build & Publish workflow builds and smoke-tests this bump. Merge to publish a fresh \`latest\`."
+          fi
