@@ -36,7 +36,11 @@ jobs:
           set -euo pipefail
           podman load --quiet --input result
           tmp="$(mktemp -d)"
-          hash="$(openssl passwd -6 -salt smoketest 'secretpass')"
+          # Use a SHA-256 ($5$) hash on purpose: it exercises the legacy crypt
+          # hash set (md5crypt/sha256crypt) that the default nixpkgs libxcrypt
+          # omits. If pam_pwdfile ever links the wrong libxcrypt again, this
+          # fails instead of silently shipping a broken image.
+          hash="$(openssl passwd -5 -salt smoketest 'secretpass')"
           printf 'tester:%s\n' "$hash" > "$tmp/pwdfile"
           podman run -d --rm --name smoke -p 127.0.0.1:16667:6667 \
             -v "$tmp/pwdfile:/etc/ngircd/pwdfile:ro" localhost/docker-ngircd:latest
